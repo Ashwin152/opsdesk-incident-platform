@@ -2,154 +2,160 @@
 pipeline {
     agent any
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
+    environment {
+        DOCKERHUB_USER = 'ashwin152'
+        EC2_HOST = '3.107.223.204'
+        EC2_USER = 'ubuntu'
+        EC2_DIR = '/home/ubuntu/opsdesk'
     }
 
     stages {
+
         stage('Checkout') {
             steps {
-                checkout scm
+                git branch: 'main',
+                    url: 'https://github.com/Ashwin152/opsdesk-incident-platform.git'
             }
         }
 
-        stage('Compile Backend') {
+        stage('Build Backend') {
             steps {
                 dir('backend') {
-                    bat 'mvn -B clean compile'
+                    bat 'mvn clean package -DskipTests'
                 }
             }
         }
 
-        stage('Validate Docker Compose') {
+        stage('Build Frontend') {
             steps {
-                bat 'docker compose config -q'
+                dir('frontend') {
+                    bat 'npm install'
+                    bat 'npm run build'
+                }
             }
         }
 
         stage('Build Docker Images') {
             steps {
-                bat 'docker compose build'
+                bat '''
+                docker build -t %DOCKERHUB_USER%/opsdesk-backend:latest ./backend
+                docker build -t %DOCKERHUB_USER%/opsdesk-frontend:latest ./frontend
+                '''
             }
         }
 
-        stage('Run Backend Tests') {
+        stage('Push Images to Docker Hub') {
             steps {
-                dir('backend') {
-                    bat 'mvn -B test'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_TOKEN'
+                    )
+                ]) {
+                    bat '''
+                    docker login -u "%DOCKER_USER%" -p "%DOCKER_TOKEN%"
+                    docker push %DOCKERHUB_USER%/opsdesk-backend:latest
+                    docker push %DOCKERHUB_USER%/opsdesk-frontend:latest
+                    docker logout
+                    '''
                 }
             }
         }
 
-        stage('Deploy Application') {
+        stage('Copy Production Compose') {
             steps {
-                bat 'docker compose up -d'
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'ec2-ssh-key',
+                        keyFileVariable: 'EC2_KEY'
+                    )
+                ]) {
+                    powershell '''
+                        $key = $env:EC2_KEY
+
+                        icacls $key /inheritance:r
+                        icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
+
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Failed to secure SSH key"
+                        }
+
+                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "mkdir -p /home/ubuntu/opsdesk"
+
+                        scp -i "$key" -o StrictHostKeyChecking=accept-new docker-compose.prod.yml ubuntu@3.107.223.204:/home/ubuntu/opsdesk/docker-compose.prod.yml
+
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Failed to copy production Compose file"
+                        }
+                    '''
+                }
             }
         }
 
-        stage('Check Backend Health') {
+        stage('Deploy to AWS EC2') {
             steps {
-                powershell '''
-                    $ErrorActionPreference = "Stop"
-                    $url = "http://localhost:8080/api/health"
-                    $success = $false
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'ec2-ssh-key',
+                        keyFileVariable: 'EC2_KEY'
+                    )
+                ]) {
+                    powershell '''
+                        $key = $env:EC2_KEY
 
-                    for ($i = 1; $i -le 30; $i++) {
-                        try {
-                            $response = Invoke-WebRequest `
-                                -Uri $url `
-                                -UseBasicParsing `
-                                -TimeoutSec 5
+                        icacls $key /inheritance:r
+                        icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 
-                            if ($response.StatusCode -eq 200) {
-                                $success = $true
-                                Write-Host "Backend health check passed."
-                                Write-Host $response.Content
-                                break
-                            }
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Failed to secure SSH key"
                         }
-                        catch {
-                            Write-Host "Waiting for backend... attempt $i of 30"
-                            Start-Sleep -Seconds 2
-                        }
-                    }
 
-                    if (-not $success) {
-                        throw "Backend health check failed."
-                    }
-                '''
+                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "cd /home/ubuntu/opsdesk && docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d"
+                        
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "EC2 deployment failed"
+                        }
+                    '''
+                }
             }
         }
 
-        stage('Check Frontend') {
+        stage('Application Health Check') {
             steps {
-                powershell '''
-                    $ErrorActionPreference = "Stop"
-                    $url = "http://localhost:3000"
-                    $success = $false
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'ec2-ssh-key',
+                        keyFileVariable: 'EC2_KEY'
+                    )
+                ]) {
+                    powershell '''
+                        $key = $env:EC2_KEY
 
-                    for ($i = 1; $i -le 30; $i++) {
-                        try {
-                            $response = Invoke-WebRequest `
-                                -Uri $url `
-                                -UseBasicParsing `
-                                -TimeoutSec 5
+                        icacls $key /inheritance:r
+                        icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 
-                            if ($response.StatusCode -eq 200) {
-                                $success = $true
-                                Write-Host "Frontend health check passed."
-                                break
-                            }
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Failed to secure SSH key"
                         }
-                        catch {
-                            Write-Host "Waiting for frontend... attempt $i of 30"
-                            Start-Sleep -Seconds 2
+
+                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "curl -fsS http://localhost/api/health"
+
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Application health check failed"
                         }
-                    }
-
-                    if (-not $success) {
-                        throw "Frontend health check failed."
-                    }
-                '''
-            }
-        }
-
-        stage('Test Incidents API') {
-            steps {
-                powershell '''
-                    $ErrorActionPreference = "Stop"
-                    $url = "http://localhost:8080/api/incidents"
-
-                    $response = Invoke-WebRequest `
-                        -Uri $url `
-                        -UseBasicParsing `
-                        -TimeoutSec 10
-
-                    if ($response.StatusCode -ne 200) {
-                        throw "Incidents API test failed."
-                    }
-
-                    Write-Host "Incidents API test passed."
-                    Write-Host $response.Content
-                '''
+                    '''
+                }
             }
         }
     }
 
     post {
         success {
-            echo 'SUCCESS: OpsDesk passed the pipeline and health checks.'
+            echo 'OpsDesk successfully deployed to AWS EC2!'
         }
-
         failure {
-            echo 'FAILURE: Check the stage logs for the error.'
-            bat 'docker compose ps'
-            bat 'docker compose logs --tail=100'
-        }
-
-        always {
-            echo 'OpsDesk CI/CD pipeline completed.'
+            echo 'OpsDesk deployment failed. Check the stage logs.'
         }
     }
 }
