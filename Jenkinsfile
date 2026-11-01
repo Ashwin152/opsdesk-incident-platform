@@ -18,7 +18,7 @@ pipeline {
             }
         }
 
-        stage('Build Backend') {
+        stage('Backend Build') {
             steps {
                 dir('backend') {
                     bat 'mvn clean package -DskipTests'
@@ -26,7 +26,7 @@ pipeline {
             }
         }
 
-        stage('Build Frontend') {
+        stage('Frontend Build') {
             steps {
                 dir('frontend') {
                     bat 'npm install'
@@ -38,13 +38,13 @@ pipeline {
         stage('Build Docker Images') {
             steps {
                 bat '''
-                docker build -t %DOCKERHUB_USER%/opsdesk-backend:latest ./backend
-                docker build -t %DOCKERHUB_USER%/opsdesk-frontend:latest ./frontend
+                    docker build -t %DOCKERHUB_USER%/opsdesk-backend:latest ./backend
+                    docker build -t %DOCKERHUB_USER%/opsdesk-frontend:latest ./frontend
                 '''
             }
         }
 
-        stage('Push Images to Docker Hub') {
+        stage('Push Images') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -54,16 +54,16 @@ pipeline {
                     )
                 ]) {
                     bat '''
-                    docker login -u "%DOCKER_USER%" -p "%DOCKER_TOKEN%"
-                    docker push %DOCKERHUB_USER%/opsdesk-backend:latest
-                    docker push %DOCKERHUB_USER%/opsdesk-frontend:latest
-                    docker logout
+                        docker login -u "%DOCKER_USER%" -p "%DOCKER_TOKEN%"
+                        docker push %DOCKERHUB_USER%/opsdesk-backend:latest
+                        docker push %DOCKERHUB_USER%/opsdesk-frontend:latest
+                        docker logout
                     '''
                 }
             }
         }
 
-        stage('Copy Production Compose') {
+        stage('Transfer Compose File') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
@@ -78,22 +78,26 @@ pipeline {
                         icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Failed to secure SSH key"
+                            throw "SSH key permission update failed"
                         }
 
                         ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "mkdir -p /home/ubuntu/opsdesk"
 
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "EC2 directory creation failed"
+                        }
+
                         scp -i "$key" -o StrictHostKeyChecking=accept-new docker-compose.prod.yml ubuntu@3.107.223.204:/home/ubuntu/opsdesk/docker-compose.prod.yml
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Failed to copy production Compose file"
+                            throw "Compose file transfer failed"
                         }
                     '''
                 }
             }
         }
 
-        stage('Deploy to AWS EC2') {
+        stage('Deploy to EC2') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
@@ -108,11 +112,11 @@ pipeline {
                         icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Failed to secure SSH key"
+                            throw "SSH key permission update failed"
                         }
 
-                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "cd /home/ubuntu/opsdesk && docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d"
-                        
+                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "cd /home/ubuntu/opsdesk && test -f .env && docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d"
+
                         if ($LASTEXITCODE -ne 0) {
                             throw "EC2 deployment failed"
                         }
@@ -121,7 +125,7 @@ pipeline {
             }
         }
 
-        stage('Application Health Check') {
+        stage('Health Check') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
@@ -136,13 +140,13 @@ pipeline {
                         icacls $key /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Failed to secure SSH key"
+                            throw "SSH key permission update failed"
                         }
 
-                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "curl -fsS http://localhost/api/health"
+                        ssh -i "$key" -o StrictHostKeyChecking=accept-new ubuntu@3.107.223.204 "for i in 1 2 3 4 5 6 7 8 9 10; do if curl -fsS http://localhost/api/health; then exit 0; fi; sleep 10; done; exit 1"
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Application health check failed"
+                            throw "OpsDesk health check failed"
                         }
                     '''
                 }
@@ -152,10 +156,11 @@ pipeline {
 
     post {
         success {
-            echo 'OpsDesk successfully deployed to AWS EC2!'
+            echo 'OpsDesk deployed successfully to AWS EC2!'
         }
+
         failure {
-            echo 'OpsDesk deployment failed. Check the stage logs.'
+            echo 'Deployment failed. Review the stage logs.'
         }
     }
 }
